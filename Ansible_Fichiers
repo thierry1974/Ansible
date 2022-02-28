@@ -1,0 +1,242 @@
+
+(ansible2.7.10) user-ansible@node-manager:~$ cat install-*
+
+################################################################################
+# ~/install-apache.yml
+---
+
+- name: "Installation apache"
+  hosts: http2
+  roles:
+    - role: "apache"
+      php_install: yes
+
+################################################################################
+# ~/install-mariadb.yml
+---
+- name: "installation mariaDB"
+  hosts: bdd2
+  gather_facts: no
+  roles:
+    - role: mariadb
+
+################################################################################
+# ~/install-mediawiki.yml
+---
+
+- name: "mediaWiki db configuration"
+  hosts: db
+  gather_facts: no
+  tags: [ "mariadb", "mysql" ]
+  roles:
+    - role: "mediawiki/confdb"
+
+- name: "MediaWiki apache configuration"
+  hosts: apache
+  gather_facts: no
+  tags: "apache"
+  roles:
+    - role: "mediawiki/confapache"
+
+
+#####################################################################################################################################
+(ansible2.7.10) user-ansible@node-manager:~$ find ./roles/ -type f | xargs cat
+
+################################################################################
+# ~/vim roles/mariadb/tasks/main.yml
+---
+
+# Installation des paquets mariadb serveur et son extension Python
+- name: "mariadb-server installation"
+  yum:
+    name: "mariadb-server,MySQL-python"
+    state: "installed"
+
+# Active le service Mariadb
+- name: "start mariadb service"
+  service:
+    name: "mariadb"
+    state: "started"
+    enabled: yes
+
+################################################################################
+# ~/roles/apache/handlers/main.yml
+---
+# handlers file for apache
+
+- name: "apache restart"
+  service:
+    name: "httpd"
+    state: "restarted"
+
+################################################################################
+# ~/roles/apache/tasks/main.yml
+---
+# tasks file for apache
+
+#1. Cette tâche permet d'installer Apache (httpd) à l'aide du module dnf
+- name: "apache installation"
+  yum:
+    name: "httpd"
+    state: "present"
+
+#2. Cette tâche active le service Apache
+- name: "apache service activation"
+  service:
+    name: "httpd"
+    state: "started"
+    enabled: yes
+
+#3. Cette tâche fait appel à un autre fichier de configuration pour installer PHP. Elle est exécutée uniquement si la variable php_install est à vraie (par défaut, elle est à faux)
+- name: "install php7 packages"
+  include: "php7-install.yml"
+  when: php_install|default(False)|bool
+
+################################################################################
+# ~/roles/apache/tasks/php7-install.yml
+---
+
+#1. Cette tâche installe le dépôt EPEL (extra Packages for Enterprise Linux)
+- name: "epel activation"
+  yum:
+    name: "epel-release"
+    state: present
+
+#.2 Cette tâche installe le dépôt REMI pour bénéficier du paquet PHP7
+- name: "remi repo activation"
+  yum:
+    name: "https://rpms.remirepo.net/enterprise/remi-release-7.rpm"
+    state: present
+
+#3. Cette tâche installe PHP7 et ses extensions
+- name: "install php70 packages"
+  yum:
+    name: "php,php-mysql,php-xml,php-mbstring,php-mcrypt,php-gd,php-intl"
+    state: latest
+    enablerepo: "remi-php70"
+
+  # S'il y a eu un changement (installation, mise à jour d'un paquet)
+  # Alors le HANDLER dont le nom est "apache restart" sera appelé. → c.f. roles/apache/handlers/main.yml 
+
+  changed_when: yes
+  notify: [ "apache restart" ]
+
+################################################################################
+# ~/roles/mediawiki/confdb/tasks/main.yml
+---
+
+#1. Installation de la base de données Mediawiki
+- name: "mediawiki database"
+  mysql_db:
+    name: "{{mediawiki_db_name}}"         # => mediawiki
+    state: present
+
+#2. Création d'un accès utilisateur et attribution des privilèges sur le base mediawiki
+- name: "mediawiki user+privileges"
+  mysql_user:
+    name: "{{mediawiki_db_user}}"
+    password: "{{mediawiki_db_password}}"
+    priv: "{{mediawiki_db_name}}.*:ALL"   # => mediawiki
+    host: "{{item}}"
+    state: present
+    with_items: "{{groups.apache}}"
+
+################################################################################
+# ~/roles/mediawiki/confdb/meta/main.yml
+dependencies:
+  - role: "mediawiki/commun"
+
+################################################################################
+# ~/roles/mediawiki/confapache/tasks/main.yml
+---
+
+#1. Création du répertoire pour l'instaltion des fichiers Mediawiki
+- name: "mediawiki directory"     
+  file:
+    path: "{{mediawiki_directory}}"     # => /var/www/html/mediawiki
+    owner: "apache"
+    group: "apache"
+    state: directory
+
+#2. Décompresse le fichier source archive Mediawiki et le formate sans extension
+- name: "uncompress mediawiki archive"
+  unarchive:
+    src: "{{mediawiki_archive_url}}"    # => https://releases… …/mediawiki/1.31/mediawiki-1.31.1.tar.gz
+    dest: "{{mediawiki_directory}}"     # => /var/www/html/mediawiki
+    owner: "apache"
+    group: "apache"
+    remote_src: yes
+      # supprime mediawiki-1.xx.x/ du chemin
+    extra_opts: --transform=s/mediawiki-[0-9\.]*\///
+
+#3. Exécute le tâche avec l'utilisateur apache, se place dans le répertoire de maintenance et exécute la commande de configuration si le fichier localsetting.php n'existe pas
+- name: "mediawiki configuration"
+  become: yes
+  become_user: "apache"
+  args:
+    creates: "{{mediawiki_directory}}/LocalSettings.php"    # => /var/www/html/mediawiki/LocalSettings.php
+    chdir: "{{mediawiki_maintenance_directory}}"            # => /var/www/html/mediawiki/maintenance (contient install.php !!)
+  command: php install.php --scriptpath /{{mediawiki_name}} --dbname mediawiki --lang fr --dbuser {{mediawiki_db_user}} --dbpass {{mediawiki_db_password}} --pass {{mediawiki_admin_password}} --dbserver {{mediawiki_db_host}} {{mediawiki_title}} {{mediawiki_admin_user}}
+  run_once: yes
+  delegate_to: "{{item}}"
+  with_items: "{{groups.apache}}"
+
+#4. Exécute la tâche avec l'utilisatteur apache, se place dans le répertoire de maintenance et exćute la commande de mise à jour de la base une seule fois
+- name: "mediawiki db update"
+  become: yes
+  become_user: "apache"
+  command: php update.php --quick
+  args:
+    chdir: "{{mediawiki_maintenance_directory}}"            # => /var/www/html/mediawiki/maintenance (contient install.php !!)
+  run_once: yes
+  register: resultat
+  changed_when: "' ...done.' in resultat.stdout"
+
+################################################################################
+# ~/roles/mediawiki/confapache/meta/main.yml
+dependencies:
+  - role: "mediawiki/commun"
+
+################################################################################
+# ~/roles/mediawiki/commun/defaults/main.yml
+---
+
+# nom de la base de données
+mediawiki_db_name: "mediawiki"
+
+# nom de l'utilisateur de la base de données et son mot de passe
+mediawiki_db_user: "mediawiki"
+mediawiki_db_password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          66356330613535306333666239643764663932353033333662643337386337656662356438376630
+          3864323234376537626464363539633861353632613539630a383462623937363638633833653165
+          64613564386532663437303438356330306131613339376532396339623264383264383033643362
+          6531663330323964650a373038323332626461363463396339363635646432316530346361353061
+          6662
+
+# nom et mot de passe de l'administrateur Mediawiki
+mediawiki_admin_user: "admin"
+mediawiki_admin_password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          66356330613535306333666239643764663932353033333662643337386337656662356438376630
+          3864323234376537626464363539633861353632613539630a383462623937363638633833653165
+          64613564386532663437303438356330306131613339376532396339623264383264383033643362
+          6531663330323964650a373038323332626461363463396339363635646432316530346361353061
+          6662
+
+# nom du Mediawiki et son titre
+mediawiki_name: "mediawiki"
+mediawiki_title: "ELS"
+
+# l'emplacement du répertoire d'installation de Mediawiki
+# => Mediawiki est un site internet…
+mediawiki_directory: "/var/www/html/{{mediawiki_name]]"
+
+# répertoire de maintenance de mediawiki
+mediawiki_maintenance_directory: "{{mediawiki_directory}}/maintenance"
+
+# Definie le premier node du groupe mariadb
+mediawiki_db_host: "{{groups.db.0}}"
+
+# l'url des sources mediawiki
+mediawiki_archive_url: "https://releases.wikimedia.org/mediawiki/1.31/mediawiki-1.31.1.tar.gz"
